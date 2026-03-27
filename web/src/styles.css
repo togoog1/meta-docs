@@ -1,0 +1,375 @@
+:root {
+  color-scheme: dark;
+  --bg: #161616;
+  --panel: rgba(0, 0, 0, 0.24);
+  --panel-soft: rgba(255, 255, 255, 0.02);
+  --ink: #ece7df;
+  --ink-soft: #b9aea0;
+  --line: rgba(255, 255, 255, 0.08);
+  --accent: #d96536;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.4;
+  font-weight: 400;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+}
+
+.docs-shell {
+  height: 100%;
+  overflow: auto;
+  padding: 20px;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 16px;
+  background:
+    radial-gradient(circle at top left, rgba(217, 101, 54, 0.18), transparent 30%),
+    linear-gradient(180deg, #161616 0%, #1e1e1e 100%);
+}
+
+.docs-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.docs-eyebrow {
+  margin: 0 0 6px;
+  color: #f2b198;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+}
+
+.docs-title {
+  margin: 0;
+  font-size: 1.95rem;
+}
+
+.docs-subtitle {
+  margin: 8px 0 0;
+  color: var(--ink-soft);
+  max-width: 720px;
+}
+
+.docs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.docs-max-pages,
+.docs-sidebar-controls input,
+.docs-sidebar-controls select {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--ink);
+}
+
+.docs-max-pages {
+  width: 88px;
+}
+
+.docs-sync-button {
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.docs-summary-grid,
+.docs-footer-grid,
+.docs-card-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.docs-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.docs-footer-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.docs-card-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 16px;
+}
+
+.docs-stat-card,
+.docs-card,
+.docs-sidebar-panel,
+.docs-detail-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+
+.docs-stat-card {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.docs-stat-card strong {
+  font-size: 1.55rem;
+}
+
+.docs-stat-label {
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+}
+
+.docs-error-banner {
+  background: rgba(231, 76, 60, 0.15);
+  border: 1px solid rgba(231, 76, 60, 0.45);
+  color: #ffd6cf;
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.docs-workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 14px;
+}
+
+.docs-sidebar-panel,
+.docs-detail-panel {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.docs-sidebar-controls {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.docs-page-list,
+.docs-link-list,
+.docs-snapshot-list,
+.docs-mini-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+  padding: 12px;
+}
+
+.docs-page-row,
+.docs-link-row,
+.docs-snapshot-row,
+.docs-mini-button {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  color: var(--ink);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.docs-page-row.active,
+.docs-snapshot-row.active {
+  border-color: rgba(217, 101, 54, 0.65);
+  background: rgba(217, 101, 54, 0.12);
+}
+
+.docs-page-row-top,
+.docs-detail-header,
+.docs-raw-meta,
+.docs-mini-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.docs-page-type,
+.docs-open-link {
+  color: #f2b198;
+  font-size: 0.78rem;
+}
+
+.docs-page-path,
+.docs-page-meta,
+.docs-mini-row span,
+.docs-mini-row small,
+.docs-link-row small,
+.docs-link-row span,
+.docs-snapshot-row span,
+.docs-snapshot-row small {
+  display: block;
+  color: var(--ink-soft);
+}
+
+.docs-detail-header {
+  padding: 18px 18px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.docs-detail-header h2,
+.docs-card h3 {
+  margin: 0;
+}
+
+.docs-detail-header p {
+  margin: 6px 0 0;
+  color: var(--ink-soft);
+}
+
+.docs-detail-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 12px 18px 0;
+}
+
+.docs-detail-tabs button {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink-soft);
+  border-radius: 999px;
+  padding: 6px 12px;
+}
+
+.docs-detail-tabs button.active {
+  background: rgba(217, 101, 54, 0.14);
+  border-color: rgba(217, 101, 54, 0.45);
+  color: #fff;
+}
+
+.docs-card {
+  padding: 14px;
+}
+
+.docs-card-wide,
+.docs-raw-card {
+  grid-column: 1 / -1;
+}
+
+.docs-kv-list {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 0;
+}
+
+.docs-kv-list div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.docs-kv-list dt {
+  color: var(--ink-soft);
+}
+
+.docs-kv-list dd {
+  margin: 0;
+  text-align: right;
+}
+
+.docs-card pre {
+  margin: 12px 0 0;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.docs-raw-card {
+  margin: 16px;
+}
+
+.docs-raw-meta {
+  color: var(--ink-soft);
+  font-size: 0.84rem;
+  padding-bottom: 10px;
+}
+
+.docs-empty-state {
+  color: var(--ink-soft);
+}
+
+.docs-empty-detail {
+  align-self: center;
+  justify-self: center;
+  text-align: center;
+  padding: 24px;
+}
+
+.docs-mini-row {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--panel-soft);
+}
+
+.docs-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+@media (max-width: 1100px) {
+  .docs-workspace,
+  .docs-summary-grid,
+  .docs-footer-grid,
+  .docs-card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .docs-header {
+    flex-direction: column;
+  }
+}
