@@ -92,7 +92,8 @@ export async function listDocPages(input: {
           httpStatus: true,
           fetchMode: true,
           fetchedAt: true,
-          contentHash: true
+          contentHash: true,
+          extractedData: true
         }
       },
       _count: {
@@ -136,7 +137,8 @@ export async function getDocPageDetail(pageId: string) {
               id: true,
               title: true,
               path: true,
-              pageType: true
+              pageType: true,
+              latestSnapshotId: true
             }
           }
         }

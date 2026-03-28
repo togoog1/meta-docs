@@ -3,7 +3,14 @@ import { createHash } from "node:crypto";
 import { DocFetchMode, DocPageType, DocRelationType } from "../../generated/prisma/client.js";
 import { docSourceDefinition } from "./source.js";
 
-const parserVersion = "meta-graph-docs-parser-v1";
+const parserVersion = "meta-graph-docs-parser-v3";
+
+interface HeadingMarker {
+  index: number;
+  heading: string;
+  level: number;
+  anchor: string | null;
+}
 
 function trimTrailingSlash(pathname: string): string {
   if (pathname.length <= 1) {
@@ -31,6 +38,56 @@ function stripTags(html: string): string {
       .replace(/\s+/gu, " ")
       .trim()
   );
+}
+
+function normalizeWhitespace(text: string): string {
+  return decodeHtml(text).replace(/\s+/gu, " ").trim();
+}
+
+function dedupeTexts(values: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+
+  return output;
+}
+
+function slugifyFragment(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+}
+
+function buildFragmentUrl(url: string, fragment: string | null): string {
+  if (!fragment) {
+    return url;
+  }
+  const parsed = new URL(url);
+  parsed.hash = fragment;
+  return parsed.toString();
+}
+
+function extractTextLines(html: string): string[] {
+  return decodeHtml(
+    html
+      .replace(/<br\s*\/?>/giu, "\n")
+      .replace(/<\/p>/giu, "\n")
+      .replace(/<\/div>/giu, "\n")
+      .replace(/<\/li>/giu, "\n")
+      .replace(/<[^>]+>/gu, " ")
+  )
+    .split("\n")
+    .map((line) => line.replace(/\s+/gu, " ").trim())
+    .filter(Boolean);
 }
 
 export function buildNoscriptUrl(url: string): string {
@@ -108,8 +165,7 @@ function extractDescription(html: string): string | null {
 }
 
 function extractHeadings(html: string): string[] {
-  const matches = [...html.matchAll(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/giu)];
-  return matches
+  return [...html.matchAll(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/giu)]
     .map((match) => stripTags(match[1] ?? ""))
     .map((value) => value.trim())
     .filter(Boolean)
@@ -117,17 +173,315 @@ function extractHeadings(html: string): string[] {
 }
 
 function extractLinks(html: string, currentUrl: string): string[] {
-  const hrefMatches = [...html.matchAll(/href="([^"]+)"/giu)];
   const urls = new Set<string>();
-
-  for (const match of hrefMatches) {
+  for (const match of html.matchAll(/href="([^"]+)"/giu)) {
     const normalized = normalizeDocUrl(match[1] ?? "", currentUrl);
     if (normalized) {
       urls.add(normalized);
     }
   }
-
   return [...urls];
+}
+
+export interface ExtractedLinkReference {
+  href: string;
+  normalizedUrl: string | null;
+  label: string;
+}
+
+export interface ExtractedTableRow {
+  cells: string[];
+  cellLines: string[][];
+  links: ExtractedLinkReference[];
+}
+
+export interface ExtractedTable {
+  caption: string | null;
+  sectionHeading: string | null;
+  sectionAnchor: string | null;
+  sourceUrl: string;
+  headers: string[];
+  rows: ExtractedTableRow[];
+  rowsTruncated: boolean;
+}
+
+export interface ExtractedSection {
+  heading: string;
+  level: number;
+  anchor: string | null;
+  sourceUrl: string;
+  paragraphs: string[];
+}
+
+export interface ExtractedNodeDirectoryEntry {
+  label: string;
+  description: string;
+  href: string | null;
+  normalizedUrl: string | null;
+  slug: string | null;
+  sectionHeading: string | null;
+  sectionAnchor: string | null;
+  sourceUrl: string;
+}
+
+export interface ExtractedReferenceEntry {
+  name: string;
+  detail: string | null;
+  description: string;
+  href: string | null;
+  normalizedUrl: string | null;
+  sectionHeading: string | null;
+  sectionAnchor: string | null;
+  sourceUrl: string;
+}
+
+export interface ExtractedReferenceCollection {
+  key: string;
+  label: string;
+  anchor: string | null;
+  sourceUrl: string;
+  entries: ExtractedReferenceEntry[];
+}
+
+function extractLinksFromHtml(html: string, currentUrl: string): ExtractedLinkReference[] {
+  return [...html.matchAll(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/giu)]
+    .map((match) => {
+      const href = match[1] ?? "";
+      return {
+        href,
+        normalizedUrl: normalizeDocUrl(href, currentUrl),
+        label: stripTags(match[2] ?? "")
+      };
+    })
+    .filter((link) => link.href.length > 0);
+}
+
+function extractParagraphsAndSections(
+  html: string,
+  responseUrl: string
+): {
+  introParagraphs: string[];
+  sections: ExtractedSection[];
+  headingMarkers: HeadingMarker[];
+  sectionUrls: string[];
+} {
+  const tokenMatches = [
+    ...html.matchAll(/<(h[1-3])([^>]*)>([\s\S]*?)<\/\1>|<p[^>]*>([\s\S]*?)<\/p>/giu)
+  ];
+  const introParagraphs: string[] = [];
+  const sections: ExtractedSection[] = [];
+  const headingMarkers: HeadingMarker[] = [];
+  let currentSection: ExtractedSection | null = null;
+
+  for (const match of tokenMatches) {
+    if (match[1]) {
+      const heading = stripTags(match[3] ?? "");
+      const headingAttrs = match[2] ?? "";
+      if (!heading) {
+        continue;
+      }
+
+      const explicitAnchor = headingAttrs.match(/\sid="([^"]+)"/iu)?.[1] ?? null;
+      const anchor = explicitAnchor ?? slugifyFragment(heading);
+      currentSection = {
+        heading,
+        level: Number.parseInt(match[1].slice(1), 10),
+        anchor,
+        sourceUrl: buildFragmentUrl(responseUrl, anchor),
+        paragraphs: []
+      };
+      sections.push(currentSection);
+      headingMarkers.push({
+        index: match.index ?? 0,
+        heading,
+        level: currentSection.level,
+        anchor
+      });
+      continue;
+    }
+
+    const paragraph = normalizeWhitespace(stripTags(match[4] ?? ""));
+    if (!paragraph || paragraph.length < 12) {
+      continue;
+    }
+
+    if (currentSection && currentSection.paragraphs.length < 4) {
+      currentSection.paragraphs.push(paragraph);
+      continue;
+    }
+
+    if (!currentSection && introParagraphs.length < 4) {
+      introParagraphs.push(paragraph);
+    }
+  }
+
+  const normalizedSections = sections
+    .map((section) => ({
+      ...section,
+      paragraphs: dedupeTexts(section.paragraphs).slice(0, 4)
+    }))
+    .filter((section) => section.heading.length > 0)
+    .slice(0, 32);
+
+  return {
+    introParagraphs: dedupeTexts(introParagraphs).slice(0, 4),
+    sections: normalizedSections,
+    headingMarkers,
+    sectionUrls: normalizedSections.map((section) => section.sourceUrl)
+  };
+}
+
+function findNearestHeadingMarker(markers: HeadingMarker[], index: number): HeadingMarker | null {
+  let nearest: HeadingMarker | null = null;
+  for (const marker of markers) {
+    if (marker.index > index) {
+      break;
+    }
+    nearest = marker;
+  }
+  return nearest;
+}
+
+function extractTables(html: string, currentUrl: string, headingMarkers: HeadingMarker[]): ExtractedTable[] {
+  const tables: ExtractedTable[] = [];
+
+  for (const match of html.matchAll(/<table\b[^>]*>([\s\S]*?)<\/table>/giu)) {
+    const tableHtml = match[0];
+    const sectionMarker = findNearestHeadingMarker(headingMarkers, match.index ?? 0);
+    const captionMatch = tableHtml.match(/<caption[^>]*>([\s\S]*?)<\/caption>/iu);
+    const headers = dedupeTexts(
+      [...tableHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/giu)]
+        .map((headerMatch) => stripTags(headerMatch[1] ?? ""))
+        .slice(0, 12)
+    );
+
+    const rows = [...tableHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/giu)]
+      .map((rowMatch) => {
+        const rowHtml = rowMatch[1] ?? "";
+        const cells = [...rowHtml.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/giu)].map((cellMatch) => {
+          const cellHtml = cellMatch[1] ?? "";
+          return {
+            text: normalizeWhitespace(stripTags(cellHtml)),
+            lines: extractTextLines(cellHtml),
+            links: extractLinksFromHtml(cellHtml, currentUrl)
+          };
+        });
+
+        return {
+          cells: cells.map((cell) => cell.text),
+          cellLines: cells.map((cell) => cell.lines),
+          links: cells.flatMap((cell) => cell.links)
+        };
+      })
+      .filter((row) => row.cells.some(Boolean));
+
+    if (rows.length === 0) {
+      continue;
+    }
+
+    const normalizedRows =
+      headers.length > 0 && (rows[0]?.cells.join("|") ?? "") === headers.join("|")
+        ? rows.slice(1)
+        : rows;
+
+    tables.push({
+      caption: captionMatch ? normalizeWhitespace(stripTags(captionMatch[1] ?? "")) : null,
+      sectionHeading: sectionMarker?.heading ?? null,
+      sectionAnchor: sectionMarker?.anchor ?? null,
+      sourceUrl: buildFragmentUrl(currentUrl, sectionMarker?.anchor ?? null),
+      headers,
+      rows: normalizedRows.slice(0, 160),
+      rowsTruncated: normalizedRows.length > 160
+    });
+  }
+
+  return tables.slice(0, 24);
+}
+
+function extractNodeDirectory(tables: ExtractedTable[]): ExtractedNodeDirectoryEntry[] {
+  for (const table of tables) {
+    const firstHeader = table.headers[0]?.toLowerCase() ?? "";
+    const secondHeader = table.headers[1]?.toLowerCase() ?? "";
+    const looksLikeNodeTable =
+      (firstHeader.includes("node") || firstHeader.includes("object")) &&
+      secondHeader.includes("description");
+
+    if (!looksLikeNodeTable) {
+      continue;
+    }
+
+    return table.rows
+      .map((row) => {
+        const primaryLink = row.links[0] ?? null;
+        const normalizedUrl = primaryLink?.normalizedUrl ?? null;
+        const slug = normalizedUrl
+          ? new URL(normalizedUrl).pathname.split("/").filter(Boolean).at(-1) ?? null
+          : null;
+
+        return {
+          label: row.cellLines[0]?.[0] ?? row.cells[0] ?? "",
+          description: row.cells[1] ?? "",
+          href: primaryLink?.href ?? null,
+          normalizedUrl,
+          slug,
+          sectionHeading: table.sectionHeading,
+          sectionAnchor: table.sectionAnchor,
+          sourceUrl: table.sourceUrl
+        };
+      })
+      .filter((entry) => entry.label.length > 0);
+  }
+
+  return [];
+}
+
+function extractReferenceCollections(tables: ExtractedTable[]): ExtractedReferenceCollection[] {
+  const collections: ExtractedReferenceCollection[] = [];
+
+  for (const table of tables) {
+    const firstHeader = table.headers[0]?.toLowerCase() ?? "";
+    const secondHeader = table.headers[1]?.toLowerCase() ?? "";
+    const collectionMeta =
+      firstHeader === "field" && secondHeader === "description"
+        ? { key: "fields", label: "Fields" }
+        : firstHeader === "edge" && secondHeader === "description"
+          ? { key: "edges", label: "Edges" }
+          : firstHeader === "parameter" && secondHeader === "description"
+            ? { key: "parameters", label: "Parameters" }
+            : firstHeader === "error" && secondHeader === "description"
+              ? { key: "errors", label: "Errors" }
+              : null;
+
+    if (!collectionMeta) {
+      continue;
+    }
+
+    collections.push({
+      key: collectionMeta.key,
+      label: collectionMeta.label,
+      anchor: table.sectionAnchor,
+      sourceUrl: table.sourceUrl,
+      entries: table.rows
+        .map((row) => {
+          const primaryLink = row.links[0] ?? null;
+          const firstCellLines = row.cellLines[0] ?? [];
+
+          return {
+            name: firstCellLines[0] ?? row.cells[0] ?? "",
+            detail: firstCellLines.slice(1).join(" · ") || null,
+            description: row.cells[1] ?? "",
+            href: primaryLink?.href ?? null,
+            normalizedUrl: primaryLink?.normalizedUrl ?? null,
+            sectionHeading: table.sectionHeading,
+            sectionAnchor: table.sectionAnchor,
+            sourceUrl: table.sourceUrl
+          };
+        })
+        .filter((entry) => entry.name.length > 0)
+    });
+  }
+
+  return collections;
 }
 
 export interface ExtractedDocSnapshot {
@@ -137,6 +491,12 @@ export interface ExtractedDocSnapshot {
   description: string | null;
   rawText: string;
   headings: string[];
+  introParagraphs: string[];
+  sections: ExtractedSection[];
+  tables: ExtractedTable[];
+  nodeDirectory: ExtractedNodeDirectoryEntry[];
+  referenceCollections: ExtractedReferenceCollection[];
+  sectionUrls: string[];
   discoveredUrls: string[];
   contentHash: string;
   extractedData: {
@@ -144,6 +504,12 @@ export interface ExtractedDocSnapshot {
     canonicalUrl: string | null;
     description: string | null;
     headings: string[];
+    introParagraphs: string[];
+    sections: ExtractedSection[];
+    tables: ExtractedTable[];
+    nodeDirectory: ExtractedNodeDirectoryEntry[];
+    referenceCollections: ExtractedReferenceCollection[];
+    sectionUrls: string[];
     discoveredUrls: string[];
     textPreview: string;
     pageType: DocPageType;
@@ -160,6 +526,10 @@ export function extractDocSnapshot(
   const canonicalUrl = extractCanonicalUrl(html);
   const description = extractDescription(html);
   const headings = extractHeadings(html);
+  const { introParagraphs, sections, headingMarkers, sectionUrls } = extractParagraphsAndSections(html, responseUrl);
+  const tables = extractTables(html, responseUrl, headingMarkers);
+  const nodeDirectory = extractNodeDirectory(tables);
+  const referenceCollections = extractReferenceCollections(tables);
   const discoveredUrls = extractLinks(html, responseUrl);
   const contentHash = createHash("sha256").update(html).digest("hex");
 
@@ -170,6 +540,12 @@ export function extractDocSnapshot(
     description,
     rawText,
     headings,
+    introParagraphs,
+    sections,
+    tables,
+    nodeDirectory,
+    referenceCollections,
+    sectionUrls,
     discoveredUrls,
     contentHash,
     extractedData: {
@@ -177,6 +553,12 @@ export function extractDocSnapshot(
       canonicalUrl,
       description,
       headings,
+      introParagraphs,
+      sections,
+      tables,
+      nodeDirectory,
+      referenceCollections,
+      sectionUrls,
       discoveredUrls,
       textPreview: rawText.slice(0, 2_000),
       pageType

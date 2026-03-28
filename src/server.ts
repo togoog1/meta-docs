@@ -19,6 +19,7 @@ import {
   listDocPages
 } from "./services/docs/queries.js";
 import { syncMetaGraphDocs } from "./services/docs/sync.js";
+import { saveDocsTreeExport } from "./services/docs/tree-export.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -147,6 +148,22 @@ async function buildServer() {
     }
   });
 
+  app.post("/api/docs/tree/export", async (_request, reply) => {
+    try {
+      const result = await saveDocsTreeExport(projectRoot);
+      return reply.status(201).send({
+        generatedAt: result.generatedAt,
+        filePath: result.filePath,
+        counts: result.counts
+      });
+    } catch (error) {
+      const normalized = normalizeError(error);
+      return reply.status(normalized.statusCode).send({
+        error: normalized.message
+      });
+    }
+  });
+
   if (existsSync(clientDistPath)) {
     await app.register(fastifyStatic, {
       root: path.join(clientDistPath, "assets"),
@@ -173,7 +190,7 @@ async function buildServer() {
 
 await initializeDatabaseSchema();
 const app = await buildServer();
-const port = Number.parseInt(process.env.PORT ?? "3002", 10);
+const port = Number.parseInt(process.env.PORT ?? "3003", 10);
 const host = process.env.HOST ?? "127.0.0.1";
 
 await app.listen({
