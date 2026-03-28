@@ -68,6 +68,14 @@ interface ExtractedReferenceCollection {
   entries: ExtractedReferenceEntry[];
 }
 
+interface GroupedReferenceCollection {
+  key: string;
+  label: string;
+  sourceUrls: string[];
+  sectionHeadings: string[];
+  entries: ExtractedReferenceEntry[];
+}
+
 interface ExtractedDataShape {
   title: string | null;
   canonicalUrl: string | null;
@@ -119,6 +127,18 @@ interface TreeExportResult {
     pages: number;
     fetchedPages: number;
   };
+}
+
+interface ImportMissingResult {
+  run: {
+    id: string;
+    status: string;
+    pagesFetched: number;
+    pagesChanged: number;
+    pagesDiscovered: number;
+    finishedAt: string | null;
+  };
+  remainingPages: number;
 }
 
 interface DocPageSummary {
@@ -246,7 +266,7 @@ const defaultOpenTreeNodes = new Set<string>([
 ]);
 
 const defaultOpenSections = new Set([
-  "map",
+  "collections",
   "outline"
 ]);
 
@@ -291,12 +311,35 @@ function formatDate(value: string | null): string {
   }).format(new Date(value));
 }
 
-function cleanDocTitle(value: string | null | undefined): string | null {
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&#(\d+);/gu, (_match, code) => String.fromCodePoint(Number.parseInt(code, 10)))
+    .replace(/&#x([0-9a-f]+);/giu, (_match, code) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&quot;/gu, "\"")
+    .replace(/&apos;|&#39;/gu, "'")
+    .replace(/&amp;/gu, "&")
+    .replace(/&lt;/gu, "<")
+    .replace(/&gt;/gu, ">")
+    .replace(/&nbsp;/gu, " ");
+}
+
+function normalizeDisplayText(value: string | null | undefined): string | null {
   if (!value) {
     return null;
   }
 
-  return value
+  return decodeHtmlEntities(value)
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function cleanDocTitle(value: string | null | undefined): string | null {
+  const normalized = normalizeDisplayText(value);
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized
     .replace(/\s*-\s*Documentation\s*-\s*Meta for Developers$/iu, "")
     .replace(/\s*-\s*Meta for Developers$/iu, "")
     .replace(/^Graph API Reference v\d+\.\d+:\s*/iu, "")
@@ -315,14 +358,61 @@ function shortHash(value: string | null | undefined): string {
 }
 
 function truncateText(value: string | null | undefined, maxLength: number): string | null {
-  if (!value) {
+  const normalized = normalizeDisplayText(value);
+  if (!normalized) {
     return null;
   }
-  const cleaned = cleanDocTitle(value) ?? value;
+  const cleaned = cleanDocTitle(normalized) ?? normalized;
   if (cleaned.length <= maxLength) {
     return cleaned;
   }
   return `${cleaned.slice(0, maxLength - 1)}…`;
+}
+
+function getPathIdentifier(url: string | null | undefined): string | null {
+  if (!url) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname.split("/").filter(Boolean).at(-1) ?? null;
+  } catch {
+    return url.split("/").filter(Boolean).at(-1) ?? null;
+  }
+}
+
+function referenceEntryDisplayName(entry: ExtractedReferenceEntry): string {
+  return normalizeDisplayText(entry.name) ?? entry.name;
+}
+
+function referenceEntryDisplayDescription(entry: ExtractedReferenceEntry): string | null {
+  const description = normalizeDisplayText(entry.description);
+  const displayName = normalizeDisplayText(referenceEntryDisplayName(entry));
+  const detail = normalizeDisplayText(entry.detail);
+
+  if (!description) {
+    return null;
+  }
+
+  if (displayName && description.localeCompare(displayName, undefined, { sensitivity: "base" }) === 0) {
+    return null;
+  }
+
+  if (detail && description.localeCompare(detail, undefined, { sensitivity: "base" }) === 0) {
+    return null;
+  }
+
+  return description;
+}
+
+function nodeDirectoryDisplayName(entry: ExtractedNodeDirectoryEntry): string {
+  return (
+    normalizeDisplayText(entry.slug) ??
+    normalizeDisplayText(getPathIdentifier(entry.normalizedUrl ?? entry.href)) ??
+    normalizeDisplayText(entry.label) ??
+    "unknown"
+  );
 }
 
 function hasSnapshot(page: Pick<DocPageSummary, "_count"> | Pick<DocPageDetail, "snapshots">): boolean {
@@ -397,8 +487,9 @@ function deriveReferenceCollections(
     .map((table) => {
       const firstHeader = table.headers[0]?.toLowerCase() ?? "";
       const secondHeader = table.headers[1]?.toLowerCase() ?? "";
+      const sectionHint = (table.sectionHeading ?? "").toLowerCase();
       const collectionMeta =
-        firstHeader === "field" && secondHeader === "description"
+        (firstHeader === "field" || firstHeader === "field name") && secondHeader === "description"
           ? { key: "fields", label: "Fields" }
           : firstHeader === "edge" && secondHeader === "description"
             ? { key: "edges", label: "Edges" }
@@ -406,7 +497,15 @@ function deriveReferenceCollections(
               ? { key: "parameters", label: "Parameters" }
               : firstHeader === "error" && secondHeader === "description"
                 ? { key: "errors", label: "Errors" }
-                : null;
+                : (firstHeader === "property name" || firstHeader === "name") && secondHeader === "description"
+                  ? sectionHint.includes("edge")
+                    ? { key: "edges", label: "Edges" }
+                    : sectionHint.includes("parameter")
+                      ? { key: "parameters", label: "Parameters" }
+                      : sectionHint.includes("error")
+                        ? { key: "errors", label: "Errors" }
+                        : { key: "fields", label: "Fields" }
+                  : null;
 
       if (!collectionMeta) {
         return null;
@@ -574,12 +673,16 @@ export function DocsExplorer() {
   const [selectedSnapshot, setSelectedSnapshot] = useState<DocSnapshotDetail | null>(null);
   const [query, setQuery] = useState("");
   const [selectedVersion, setSelectedVersion] = useState("latest");
-  const [maxPages, setMaxPages] = useState("40");
+
   const [directoryQuery, setDirectoryQuery] = useState("");
+  const [collectionQuery, setCollectionQuery] = useState("");
+  const [activeCollectionKey, setActiveCollectionKey] = useState<string | null>(null);
   const [openTreeNodes, setOpenTreeNodes] = useState<Set<string>>(new Set(defaultOpenTreeNodes));
   const [openSections, setOpenSections] = useState<Set<string>>(new Set(defaultOpenSections));
   const [loading, setLoading] = useState(false);
-  const [syncing, setSyncing] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [importingMissing, setImportingMissing] = useState(false);
+
   const [exporting, setExporting] = useState(false);
   const [copyingTree, setCopyingTree] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -618,6 +721,7 @@ export function DocsExplorer() {
       setPageDetail(next);
       setSelectedSnapshot(next.latestSnapshot);
       setDirectoryQuery("");
+      setCollectionQuery("");
       setError(null);
       setNotice(null);
     } catch (nextError) {
@@ -654,25 +758,21 @@ export function DocsExplorer() {
     void loadPageDetail(selectedPageId);
   }, [selectedPageId]);
 
-  async function handleSync() {
-    setSyncing(true);
+  async function handleFetchPage(pageId: string) {
+    setFetching(true);
     try {
-      await requestJson("/api/docs/sync", {
+      await requestJson(`/api/docs/pages/${pageId}/fetch`, {
         method: "POST",
-        body: JSON.stringify({
-          maxPages: Number.parseInt(maxPages, 10) || 40
-        })
+        body: "{}"
       });
-      await Promise.all([loadOverview(), loadPages()]);
-      if (selectedPageId) {
-        await loadPageDetail(selectedPageId);
-      }
+      await loadPageDetail(pageId);
+      await loadPages();
       setError(null);
       setNotice(null);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Failed to sync docs");
+      setError(nextError instanceof Error ? nextError.message : "Failed to fetch page");
     } finally {
-      setSyncing(false);
+      setFetching(false);
     }
   }
 
@@ -689,6 +789,42 @@ export function DocsExplorer() {
       setNotice(null);
     } finally {
       setExporting(false);
+    }
+  }
+
+  async function handleImportMissingPages() {
+    setImportingMissing(true);
+    try {
+      const result = await requestJson<ImportMissingResult>("/api/docs/import-missing", {
+        method: "POST",
+        body: JSON.stringify({
+          referenceOnly: true,
+          version: selectedVersion
+        })
+      });
+
+      await loadOverview();
+      await loadPages();
+      if (selectedPageId) {
+        await loadPageDetail(selectedPageId);
+      }
+
+      setNotice(
+        result.remainingPages > 0
+          ? `Imported ${result.run.pagesFetched} missing pages. ${result.remainingPages} still missing.`
+          : `Imported ${result.run.pagesFetched} missing pages. Reference scope is fully fetched.`
+      );
+      setError(null);
+    } catch (nextError) {
+      const message = nextError instanceof Error ? nextError.message : "Failed to import missing pages";
+      setError(
+        message === "Not Found"
+          ? "Import Missing API route is not loaded. Restart the API server so the new backend route is available."
+          : message
+      );
+      setNotice(null);
+    } finally {
+      setImportingMissing(false);
     }
   }
 
@@ -734,7 +870,6 @@ export function DocsExplorer() {
   const extracted = selectedSnapshot?.extractedData ?? null;
   const currentSourceUrl =
     selectedSnapshot?.responseUrl ?? extracted?.canonicalUrl ?? pageDetail?.canonicalUrl ?? pageDetail?.url ?? null;
-  const currentSourceLabel = formatSourceLabel(currentSourceUrl);
   const cleanedDescription = cleanDocTitle(extracted?.description) ?? extracted?.description ?? null;
   const introParagraphs = extracted?.introParagraphs?.length
     ? extracted.introParagraphs
@@ -750,6 +885,80 @@ export function DocsExplorer() {
   const tables = extracted?.tables ?? [];
   const nodeDirectory = extracted?.nodeDirectory ?? [];
   const referenceCollections = deriveReferenceCollections(extracted, currentSourceUrl);
+  const groupedReferenceCollections = useMemo(() => {
+    const groups = new Map<string, GroupedReferenceCollection>();
+    const order = ["fields", "edges", "parameters", "errors"];
+
+    for (const collection of referenceCollections) {
+      const existing =
+        groups.get(collection.key) ??
+        {
+          key: collection.key,
+          label: collection.label,
+          sourceUrls: [],
+          sectionHeadings: [],
+          entries: []
+        };
+
+      const existingEntryKeys = new Set(
+        existing.entries.map((entry) =>
+          [
+            entry.name,
+            entry.detail ?? "",
+            entry.description ?? "",
+            entry.sourceUrl,
+            entry.normalizedUrl ?? ""
+          ].join("::")
+        )
+      );
+
+      if (!existing.sourceUrls.includes(collection.sourceUrl)) {
+        existing.sourceUrls.push(collection.sourceUrl);
+      }
+
+      for (const entry of collection.entries) {
+        if (entry.sectionHeading && !existing.sectionHeadings.includes(entry.sectionHeading)) {
+          existing.sectionHeadings.push(entry.sectionHeading);
+        }
+
+        const dedupeKey = [
+          entry.name,
+          entry.detail ?? "",
+          entry.description ?? "",
+          entry.sourceUrl,
+          entry.normalizedUrl ?? ""
+        ].join("::");
+
+        if (existingEntryKeys.has(dedupeKey)) {
+          continue;
+        }
+
+        existing.entries.push(entry);
+        existingEntryKeys.add(dedupeKey);
+      }
+
+      groups.set(collection.key, existing);
+    }
+
+    return [...groups.values()].sort((left, right) => {
+      const leftIndex = order.indexOf(left.key);
+      const rightIndex = order.indexOf(right.key);
+      if (leftIndex !== -1 || rightIndex !== -1) {
+        if (leftIndex === -1) {
+          return 1;
+        }
+        if (rightIndex === -1) {
+          return -1;
+        }
+        return leftIndex - rightIndex;
+      }
+      return left.label.localeCompare(right.label, undefined, { sensitivity: "base" });
+    });
+  }, [referenceCollections]);
+  const activeReferenceCollection =
+    groupedReferenceCollections.find((collection) => collection.key === activeCollectionKey) ??
+    groupedReferenceCollections[0] ??
+    null;
   const defaultFocusedTarget = useMemo(
     () =>
       pageDetail
@@ -769,6 +978,34 @@ export function DocsExplorer() {
       `${entry.label} ${entry.description} ${entry.slug ?? ""}`.toLowerCase().includes(lookup)
     );
   }, [directoryQuery, nodeDirectory]);
+
+  const filteredCollectionEntries = useMemo(() => {
+    if (!activeReferenceCollection) {
+      return [];
+    }
+
+    const lookup = collectionQuery.trim().toLowerCase();
+    if (!lookup) {
+      return activeReferenceCollection.entries;
+    }
+
+    return activeReferenceCollection.entries.filter((entry) =>
+      `${entry.name} ${entry.detail ?? ""} ${entry.description} ${entry.sectionHeading ?? ""} ${entry.sourceUrl}`.toLowerCase().includes(lookup)
+    );
+  }, [activeReferenceCollection, collectionQuery]);
+
+  useEffect(() => {
+    if (groupedReferenceCollections.length === 0) {
+      setActiveCollectionKey(null);
+      return;
+    }
+
+    setActiveCollectionKey((current) =>
+      current && groupedReferenceCollections.some((collection) => collection.key === current)
+        ? current
+        : groupedReferenceCollections[0]?.key ?? null
+    );
+  }, [groupedReferenceCollections]);
 
   const outgoingChildren = pageDetail?.outgoingLinks.filter(
     (link) => link.relationType === "DISCOVERED_CHILD" || link.relationType === "CHANGELOG_ENTRY"
@@ -833,7 +1070,7 @@ export function DocsExplorer() {
         referenceIndexPage?.snapshots[0]?.extractedData?.description ??
         referenceIndexPage?.snapshots[0]?.extractedData?.introParagraphs?.[0] ??
         null,
-      badge: referenceIndexPage ? (referenceIndexPage._count.snapshots > 0 ? "fetched" : "discovered") : null,
+      badge: referenceIndexPage && referenceIndexPage._count.snapshots === 0 ? "discovered" : null,
       count: referenceIndexPage?._count.outgoingLinks ?? undefined,
       children: [],
       target: referenceIndexPage
@@ -848,7 +1085,6 @@ export function DocsExplorer() {
         : undefined
     };
     const rootNodes: SidebarTreeNode[] = [rootReferenceNode];
-    const selectedPage = referencePages.find((page) => page.id === selectedPageId) ?? null;
 
     function ensureFolder(pathParts: string[]): { siblings: SidebarTreeNode[]; folder: SidebarTreeNode | null } {
       let siblings = rootReferenceNode.children;
@@ -892,7 +1128,7 @@ export function DocsExplorer() {
 
       if (leafLabel === "index" && folder) {
         folder.secondary = page.title && page.title !== leafLabel ? page.title : pageDescription;
-        folder.badge = page._count.snapshots > 0 ? "fetched" : "discovered";
+        folder.badge = page._count.snapshots === 0 ? "discovered" : null;
         folder.count = page._count.outgoingLinks;
         folder.target = makePageTarget(page, titleForPage(page), page.url, pageDescription);
         continue;
@@ -903,124 +1139,15 @@ export function DocsExplorer() {
         kind: "page",
         label: humanizeSegment(leafLabel),
         secondary: page.title && page.title !== leafLabel ? page.title : pageDescription,
-        badge: page._count.snapshots > 0 ? "fetched" : "discovered",
+        badge: page._count.snapshots === 0 ? "discovered" : null,
         count: page._count.outgoingLinks,
         children: [],
         target: makePageTarget(page, titleForPage(page), page.url, pageDescription)
       });
     }
 
-    if (selectedPage && pageDetail && selectedPage.id === pageDetail.id) {
-      const selectedNode = rootNodes
-        .flatMap(function flatten(node): SidebarTreeNode[] {
-          return [node, ...node.children.flatMap(flatten)];
-        })
-        .find((node) => node.target?.pageId === selectedPage.id && node.target.kind === "page");
-
-      if (selectedNode) {
-        const selectedChildren: SidebarTreeNode[] = [];
-
-        if (sections.length > 0) {
-          selectedChildren.push({
-            id: `page-sections:${selectedPage.id}`,
-            kind: "folder",
-            label: "sections",
-            count: sections.length,
-            children: sections.map((section) => ({
-              id: `section:${selectedPage.id}:${section.anchor ?? section.heading}`,
-              kind: "section",
-              label: section.heading,
-              secondary: truncateText(section.paragraphs[0], 88),
-              children: [],
-              target: {
-                id: `section:${selectedPage.id}:${section.anchor ?? section.heading}`,
-                kind: "section",
-                pageId: selectedPage.id,
-                label: section.heading,
-                description: section.paragraphs[0] ?? null,
-                path: pageDetail.path,
-                sourceUrl: section.sourceUrl ?? null
-              }
-            }))
-          });
-        }
-
-        if (referenceCollections.length > 0) {
-          selectedChildren.push({
-            id: `page-collections:${selectedPage.id}`,
-            kind: "folder",
-            label: "collections",
-            count: referenceCollections.length,
-            children: referenceCollections.map((collection) => ({
-              id: `collection:${selectedPage.id}:${collection.key}`,
-              kind: "collection",
-              label: collection.label,
-              secondary: formatSourceLabel(collection.sourceUrl),
-              count: collection.entries.length,
-              children: collection.entries.map((entry) => {
-                const linkedPage = entry.normalizedUrl ? storedPageByUrl.get(entry.normalizedUrl) ?? null : null;
-                return {
-                  id: `entry:${selectedPage.id}:${collection.key}:${entry.name}`,
-                  kind: "entry",
-                  label: entry.name,
-                  secondary: truncateText(entry.description, 72),
-                  badge: linkedPage ? "linked" : null,
-                  children: [],
-                  target: {
-                    id: `entry:${selectedPage.id}:${collection.key}:${entry.name}`,
-                    kind: "entry",
-                    pageId: selectedPage.id,
-                    label: entry.name,
-                    description: entry.description,
-                    detail: entry.detail,
-                    path: pageDetail.path,
-                    sourceUrl: entry.sourceUrl,
-                    linkedPageId: linkedPage?.id ?? null,
-                    linkedPageLabel: linkedPage ? titleForPage(linkedPage) : null
-                  }
-                };
-              })
-            }))
-          });
-        }
-
-        if (nodeDirectory.length > 0) {
-          selectedChildren.push({
-            id: `page-directory:${selectedPage.id}`,
-            kind: "folder",
-            label: "directory",
-            count: nodeDirectory.length,
-            children: nodeDirectory.map((entry) => {
-              const linkedPage = entry.normalizedUrl ? storedPageByUrl.get(entry.normalizedUrl) ?? null : null;
-              return {
-                id: `directory:${selectedPage.id}:${entry.slug ?? entry.label}`,
-                kind: "directory",
-                label: entry.label,
-                secondary: truncateText(entry.description, 72),
-                badge: linkedPage ? "linked" : null,
-                children: [],
-                target: {
-                  id: `directory:${selectedPage.id}:${entry.slug ?? entry.label}`,
-                  kind: "directory",
-                  pageId: selectedPage.id,
-                  label: entry.label,
-                  description: entry.description,
-                  path: pageDetail.path,
-                  sourceUrl: entry.sourceUrl ?? entry.normalizedUrl ?? null,
-                  linkedPageId: linkedPage?.id ?? null,
-                  linkedPageLabel: linkedPage ? titleForPage(linkedPage) : null
-                }
-              };
-            })
-          });
-        }
-
-        selectedNode.children = selectedChildren;
-      }
-    }
-
     return rootNodes;
-  }, [nodeDirectory, pageDetail, referenceCollections, referencePages, sections, selectedPageId, storedPageByUrl]);
+  }, [referencePages, selectedPageId, storedPageByUrl]);
 
   useEffect(() => {
     if (!selectedPageId) {
@@ -1072,18 +1199,9 @@ export function DocsExplorer() {
       } else if (buildReferenceTreePath(pageDetail.path).leafLabel !== "index") {
         next.add(`page:${pageDetail.id}`);
       }
-      if (sections.length > 0) {
-        next.add(`page-sections:${pageDetail.id}`);
-      }
-      if (referenceCollections.length > 0) {
-        next.add(`page-collections:${pageDetail.id}`);
-      }
-      if (nodeDirectory.length > 0) {
-        next.add(`page-directory:${pageDetail.id}`);
-      }
       return next;
     });
-  }, [nodeDirectory.length, pageDetail, referenceCollections.length, sections.length]);
+  }, [pageDetail]);
 
   function handleTreeNodeSelect(node: SidebarTreeNode) {
     if (!node.target) {
@@ -1137,12 +1255,12 @@ export function DocsExplorer() {
             <button type="button" className="docs-tree-node-button" onClick={() => handleTreeNodeSelect(node)}>
               <div className="docs-tree-node-main">
                 <span className="docs-tree-node-label">{node.label}</span>
-                {node.badge ? <span className={`docs-tree-node-badge ${node.badge}`}>{node.badge}</span> : null}
+                {node.badge ? <span className={`docs-tree-node-badge ${node.badge}`}>D</span> : null}
               </div>
               {node.secondary ? <span className="docs-tree-node-secondary">{node.secondary}</span> : null}
             </button>
 
-            {typeof node.count === "number" ? <span className="docs-tree-node-count">{node.count}</span> : null}
+            {typeof node.count === "number" && node.count > 0 ? <span className="docs-tree-node-count">{node.count}</span> : null}
           </div>
 
           {isExpandable && isOpen ? <div className="docs-tree-children">{renderTreeNodes(node.children, depth + 1)}</div> : null}
@@ -1226,12 +1344,14 @@ export function DocsExplorer() {
                 </option>
               ))}
             </select>
-            <input
-              className="docs-max-pages"
-              value={maxPages}
-              onChange={(event) => setMaxPages(event.target.value)}
-              placeholder="40"
-            />
+            <button
+              className="docs-secondary-button"
+              type="button"
+              onClick={() => void handleImportMissingPages()}
+              disabled={importingMissing}
+            >
+              {importingMissing ? "Importing..." : "Import Missing"}
+            </button>
             <button
               className="docs-secondary-button"
               type="button"
@@ -1239,9 +1359,6 @@ export function DocsExplorer() {
               disabled={exporting}
             >
               {exporting ? "Exporting..." : "Export Tree"}
-            </button>
-            <button className="docs-sync-button" type="button" onClick={() => void handleSync()} disabled={syncing}>
-              {syncing ? "Syncing..." : "Sync Docs"}
             </button>
           </div>
         </header>
@@ -1257,10 +1374,29 @@ export function DocsExplorer() {
                   <h2>{titleForPage(pageDetail)}</h2>
                   <p>{pageDetail.path}</p>
                   {cleanedDescription ? <p className="docs-detail-description">{cleanedDescription}</p> : null}
+                {introParagraphs.length > 0 && introParagraphs.join(" ") !== (cleanedDescription ?? "") ? (
+                  <div className="docs-intro-paragraphs">
+                    {introParagraphs.map((paragraph) => (
+                      <p key={paragraph}>{paragraph}</p>
+                    ))}
+                  </div>
+                ) : null}
                 </div>
-                <a href={pageDetail.url} target="_blank" rel="noreferrer" className="docs-open-link">
-                  Open Source Page
-                </a>
+                <div className="docs-detail-actions">
+                  {!hasSnapshot(pageDetail) ? (
+                    <button
+                      type="button"
+                      className="docs-fetch-button"
+                      onClick={() => void handleFetchPage(pageDetail.id)}
+                      disabled={fetching}
+                    >
+                      {fetching ? "Fetching..." : "Fetch Docs"}
+                    </button>
+                  ) : null}
+                  <a href={pageDetail.url} target="_blank" rel="noreferrer" className="docs-open-link">
+                    Open Source Page
+                  </a>
+                </div>
               </div>
 
               <div className="docs-detail-body">
@@ -1270,14 +1406,6 @@ export function DocsExplorer() {
                     <strong>{pageDetail.pageType}</strong>
                   </div>
                   <div className="docs-fact-pill">
-                    <span>Snapshots</span>
-                    <strong>{pageDetail.snapshots.length}</strong>
-                  </div>
-                  <div className="docs-fact-pill">
-                    <span>Collections</span>
-                    <strong>{referenceCollections.length}</strong>
-                  </div>
-                  <div className="docs-fact-pill">
                     <span>Updated</span>
                     <strong>{formatDate(pageDetail.updatedAt)}</strong>
                   </div>
@@ -1285,191 +1413,132 @@ export function DocsExplorer() {
 
                 <div className="docs-accordion-stack">
                   <AccordionSection
-                    id="overview"
-                    title="Overview"
-                    meta={`${referenceCollections.length} collections · ${sections.length} sections · ${tables.length} tables`}
-                    isOpen={openSections.has("overview")}
+                    id="collections"
+                    title="Reference Collections"
+                    meta={`${referenceCollections.reduce((sum, collection) => sum + collection.entries.length, 0)} entries · ${filteredNodeDirectory.length} directory rows`}
+                    isOpen={openSections.has("collections")}
                     onToggle={toggleSection}
                   >
                     <div className="docs-card-grid docs-accordion-grid">
-                      <div className="docs-card">
-                        <h3>Page Identity</h3>
-                        <dl className="docs-kv-list">
-                          <div><dt>Type</dt><dd>{pageDetail.pageType}</dd></div>
-                          <div><dt>Stored Path</dt><dd className="docs-kv-value-long docs-mono">{pageDetail.path}</dd></div>
-                          <div><dt>Current Source</dt><dd className="docs-kv-value-long"><a href={currentSourceUrl ?? pageDetail.url} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">{currentSourceLabel}</a></dd></div>
-                          <div><dt>Canonical</dt><dd className="docs-kv-value-long">{pageDetail.canonicalUrl ? <a href={pageDetail.canonicalUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">{formatSourceLabel(pageDetail.canonicalUrl)}</a> : "Not set"}</dd></div>
-                          <div><dt>Updated</dt><dd>{formatDate(pageDetail.updatedAt)}</dd></div>
-                        </dl>
-                      </div>
+                      {groupedReferenceCollections.length > 0 ? (
+                        <div className="docs-card docs-card-wide">
+                          <div className="docs-reference-toolbar">
+                            <div className="docs-reference-tabs" role="tablist" aria-label="Reference collections">
+                              {groupedReferenceCollections.map((collection) => (
+                                <button
+                                  key={collection.key}
+                                  type="button"
+                                  role="tab"
+                                  aria-selected={activeReferenceCollection?.key === collection.key}
+                                  className={`docs-reference-tab ${activeReferenceCollection?.key === collection.key ? "active" : ""}`}
+                                  onClick={() => setActiveCollectionKey(collection.key)}
+                                >
+                                  <strong>{collection.label}</strong>
+                                  <span>{collection.entries.length}</span>
+                                </button>
+                              ))}
+                            </div>
+                            <input
+                              className="docs-inline-search"
+                              value={collectionQuery}
+                              onChange={(event) => setCollectionQuery(event.target.value)}
+                              placeholder={`Filter ${activeReferenceCollection?.label.toLowerCase() ?? "collection"} entries`}
+                            />
+                          </div>
 
-                      <div className="docs-card">
-                        <h3>Extraction Shape</h3>
-                        <dl className="docs-kv-list">
-                          <div><dt>Parser</dt><dd>{selectedSnapshot?.parserVersion ?? "Unknown"}</dd></div>
-                          <div><dt>Headings</dt><dd>{extracted?.headings.length ?? 0}</dd></div>
-                          <div><dt>Sections</dt><dd>{sections.length}</dd></div>
-                          <div><dt>Tables</dt><dd>{tables.length}</dd></div>
-                          <div><dt>Node Rows</dt><dd>{nodeDirectory.length}</dd></div>
-                          <div><dt>Collections</dt><dd>{referenceCollections.length}</dd></div>
-                          <div><dt>Discovered URLs</dt><dd>{extracted?.discoveredUrls.length ?? 0}</dd></div>
-                        </dl>
-                      </div>
-
-                      <div className="docs-card">
-                        <h3>Navigation</h3>
-                        <dl className="docs-kv-list">
-                          <div><dt>Section URLs</dt><dd>{extracted?.sectionUrls?.length ?? sections.length}</dd></div>
-                          <div><dt>Outgoing Links</dt><dd>{pageDetail.outgoingLinks.length}</dd></div>
-                          <div><dt>Incoming Links</dt><dd>{pageDetail.incomingLinks.length}</dd></div>
-                          <div><dt>Has Snapshot</dt><dd>{hasSnapshot(pageDetail) ? "Yes" : "No"}</dd></div>
-                        </dl>
-                      </div>
-
-                      <div className="docs-card">
-                        <h3>Focused Tree Node</h3>
-                        {activeFocusedTarget ? (
-                          <>
-                            <dl className="docs-kv-list">
-                              <div><dt>Kind</dt><dd>{activeFocusedTarget.kind}</dd></div>
-                              <div><dt>Label</dt><dd>{activeFocusedTarget.label}</dd></div>
-                              <div><dt>Path</dt><dd className="docs-kv-value-long docs-mono">{activeFocusedTarget.path ?? pageDetail.path}</dd></div>
-                              <div><dt>Source</dt><dd className="docs-kv-value-long">{activeFocusedTarget.sourceUrl ? <a href={activeFocusedTarget.sourceUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">{formatSourceLabel(activeFocusedTarget.sourceUrl)}</a> : "Not set"}</dd></div>
-                              {activeFocusedTarget.linkedPageId ? (
+                          {activeReferenceCollection ? (
+                            <section className="docs-reference-card">
+                              <div className="docs-reference-card-header">
                                 <div>
-                                  <dt>Linked Page</dt>
-                                  <dd>
-                                    <button
-                                      type="button"
-                                      className="docs-link-pill"
-                                      onClick={() => {
-                                        setSelectedPageId(activeFocusedTarget.linkedPageId ?? null);
-                                        setFocusedTreeTarget(null);
-                                      }}
-                                    >
-                                      {activeFocusedTarget.linkedPageLabel ?? "Open linked page"}
-                                    </button>
-                                  </dd>
+                                  <strong>{activeReferenceCollection.label}</strong>
+                                  <p>
+                                    {filteredCollectionEntries.length === activeReferenceCollection.entries.length
+                                      ? `${activeReferenceCollection.entries.length} entries`
+                                      : `${filteredCollectionEntries.length} of ${activeReferenceCollection.entries.length} entries`}
+                                    {activeReferenceCollection.sectionHeadings.length > 0
+                                      ? ` · ${activeReferenceCollection.sectionHeadings.length} sections`
+                                      : ""}
+                                  </p>
                                 </div>
-                              ) : null}
-                            </dl>
-                            {activeFocusedTarget.detail ? <p className="docs-focused-detail docs-mono">{activeFocusedTarget.detail}</p> : null}
-                            {activeFocusedTarget.description ? <p className="docs-focused-detail">{activeFocusedTarget.description}</p> : null}
-                          </>
-                        ) : (
-                          <p className="docs-empty-state">Select a tree node to inspect its source location.</p>
-                        )}
-                      </div>
+                                <div className="docs-table-actions">
+                                  {activeReferenceCollection.sourceUrls.slice(0, 3).map((sourceUrl) => (
+                                    <a
+                                      key={sourceUrl}
+                                      href={sourceUrl}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="docs-open-link docs-mono"
+                                    >
+                                      {formatSourceLabel(sourceUrl)}
+                                    </a>
+                                  ))}
+                                </div>
+                              </div>
 
-                      <div className="docs-card docs-card-wide">
-                        <h3>Intro</h3>
-                        {introParagraphs.length > 0 ? (
-                          <div className="docs-prose">
-                            {introParagraphs.map((paragraph) => (
-                              <p key={paragraph}>{paragraph}</p>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="docs-empty-state">No intro paragraphs extracted yet.</p>
-                        )}
-                      </div>
-                    </div>
-                  </AccordionSection>
-
-                  <AccordionSection
-                    id="map"
-                    title="Node Map"
-                    meta={`${referenceCollections.reduce((sum, collection) => sum + collection.entries.length, 0)} child entries · ${filteredNodeDirectory.length} directory rows`}
-                    isOpen={openSections.has("map")}
-                    onToggle={toggleSection}
-                  >
-                    <div className="docs-card-grid docs-accordion-grid">
-                      <div className="docs-card docs-card-wide">
-                        <div className="docs-card-header">
-                          <div>
-                            <h3>Current Node</h3>
-                            <p>This page is the parent node. Collections below describe its children and related surfaces.</p>
-                          </div>
+                              {filteredCollectionEntries.length > 0 ? (
+                                <div className="docs-reference-list">
+                                  {filteredCollectionEntries.map((entry) => {
+                                    const linkedPage = entry.normalizedUrl ? storedPageByUrl.get(entry.normalizedUrl) ?? null : null;
+                                    const entryDescription = referenceEntryDisplayDescription(entry);
+                                    return (
+                                      <article
+                                        key={`${activeReferenceCollection.key}-${entry.name}-${entry.normalizedUrl ?? entry.description}`}
+                                        className="docs-reference-entry"
+                                      >
+                                        <div className="docs-reference-entry-main">
+                                          <div className="docs-reference-entry-heading">
+                                            <strong className="docs-mono">{referenceEntryDisplayName(entry)}</strong>
+                                            {entry.detail ? <span className="docs-reference-entry-detail docs-mono">{truncateText(entry.detail, 64)}</span> : null}
+                                          </div>
+                                          {entryDescription ? (
+                                            <p className="docs-reference-entry-description" title={entryDescription}>
+                                              {truncateText(entryDescription, 140)}
+                                            </p>
+                                          ) : null}
+                                        </div>
+                                        <div className="docs-reference-entry-meta">
+                                          {entry.sectionHeading ? (
+                                            <span className="docs-outline-tag">{entry.sectionHeading}</span>
+                                          ) : null}
+                                          {entry.sourceUrl ? (
+                                            <a href={entry.sourceUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
+                                              {formatSourceLabel(entry.sourceUrl)}
+                                            </a>
+                                          ) : null}
+                                          {linkedPage ? (
+                                            <button
+                                              type="button"
+                                              className="docs-link-pill"
+                                              onClick={() => setSelectedPageId(linkedPage.id)}
+                                            >
+                                              Open
+                                            </button>
+                                          ) : entry.normalizedUrl ? (
+                                            <a href={entry.normalizedUrl} target="_blank" rel="noreferrer" className="docs-link-pill docs-mono">
+                                              Target
+                                            </a>
+                                          ) : null}
+                                        </div>
+                                      </article>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <p className="docs-empty-state">No matching entries in this collection.</p>
+                              )}
+                            </section>
+                          ) : null}
                         </div>
-                        <div className="docs-root-node">
-                          <strong>{titleForPage(pageDetail)}</strong>
-                          <span className="docs-mono">{pageDetail.path}</span>
-                          <a href={currentSourceUrl ?? pageDetail.url} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
-                            {currentSourceLabel}
-                          </a>
-                        </div>
-                      </div>
-
-                      {referenceCollections.length > 0 ? (
+                      ) : (
                         <div className="docs-card docs-card-wide">
                           <div className="docs-card-header">
                             <div>
                               <h3>Reference Collections</h3>
-                              <p>Field, edge, parameter, and error tables grouped by the source section they came from.</p>
+                              <p>No field, edge, parameter, or error tables were extracted for this page yet.</p>
                             </div>
                           </div>
-                          <div className="docs-reference-stack">
-                            {referenceCollections.map((collection) => (
-                              <section key={`${collection.key}-${collection.sourceUrl}`} className="docs-reference-card">
-                                <div className="docs-reference-card-header">
-                                  <div>
-                                    <strong>{collection.label}</strong>
-                                    <p>{collection.entries.length} entries</p>
-                                  </div>
-                                  <a href={collection.sourceUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
-                                    {formatSourceLabel(collection.sourceUrl)}
-                                  </a>
-                                </div>
-                                <div className="docs-data-table-wrap">
-                                  <table className="docs-data-table">
-                                    <thead>
-                                      <tr>
-                                        <th>{collection.label.slice(0, -1) || "Entry"}</th>
-                                        <th>Detail</th>
-                                        <th>Description</th>
-                                        <th>Navigate</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      {collection.entries.map((entry) => {
-                                        const linkedPage = entry.normalizedUrl ? storedPageByUrl.get(entry.normalizedUrl) ?? null : null;
-                                        return (
-                                          <tr key={`${collection.key}-${entry.name}-${entry.normalizedUrl ?? entry.description}`}>
-                                            <td>
-                                              <div className="docs-node-cell">
-                                                <strong>{entry.name}</strong>
-                                                {entry.sectionHeading ? <span className="docs-node-slug">{entry.sectionHeading}</span> : null}
-                                              </div>
-                                            </td>
-                                            <td>{entry.detail ? <span className="docs-mono">{entry.detail}</span> : "—"}</td>
-                                            <td>{entry.description || "No description extracted."}</td>
-                                            <td>
-                                              <div className="docs-table-actions">
-                                                {linkedPage ? (
-                                                  <button
-                                                    type="button"
-                                                    className="docs-link-pill"
-                                                    onClick={() => setSelectedPageId(linkedPage.id)}
-                                                  >
-                                                    {linkedPage._count.snapshots > 0 ? "Open stored page" : "Open discovered page"}
-                                                  </button>
-                                                ) : null}
-                                                <a href={entry.sourceUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
-                                                  {formatSourceLabel(entry.sourceUrl)}
-                                                </a>
-                                              </div>
-                                            </td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-                                  </table>
-                                </div>
-                              </section>
-                            ))}
-                          </div>
                         </div>
-                      ) : null}
+                      )}
 
                       <div className="docs-card docs-card-wide">
                         <div className="docs-card-header">
@@ -1493,7 +1562,6 @@ export function DocsExplorer() {
                                   <th>Node</th>
                                   <th>Description</th>
                                   <th>Target</th>
-                                  <th>Source</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -1503,44 +1571,26 @@ export function DocsExplorer() {
                                     <tr key={`${entry.label}-${entry.normalizedUrl ?? entry.href ?? entry.description}`}>
                                       <td>
                                         <div className="docs-node-cell">
-                                          <strong>{entry.label}</strong>
-                                          {entry.slug ? <span className="docs-node-slug">{entry.slug}</span> : null}
+                                          <strong className="docs-mono">{nodeDirectoryDisplayName(entry)}</strong>
                                         </div>
                                       </td>
-                                      <td>{entry.description || "No description extracted."}</td>
-                                      <td>
-                                        <div className="docs-table-actions">
-                                          {linkedPage ? (
-                                            <button
-                                              type="button"
-                                              className="docs-link-pill"
-                                              onClick={() => setSelectedPageId(linkedPage.id)}
-                                            >
-                                              {linkedPage._count.snapshots > 0 ? "Open stored page" : "Open discovered page"}
-                                            </button>
-                                          ) : null}
-                                          {entry.normalizedUrl ? (
-                                            <a href={entry.normalizedUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
-                                              {formatSourceLabel(entry.normalizedUrl)}
-                                            </a>
-                                          ) : (
-                                            <span className="docs-empty-state">No target</span>
-                                          )}
-                                        </div>
+                                      <td className="docs-data-table-description" title={normalizeDisplayText(entry.description) ?? undefined}>
+                                        {truncateText(entry.description, 110) || "No description extracted."}
                                       </td>
                                       <td>
-                                        {entry.sourceUrl || currentSourceUrl ? (
-                                          <a
-                                            href={entry.sourceUrl ?? currentSourceUrl ?? pageDetail.url}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            className="docs-open-link docs-mono"
+                                        {linkedPage ? (
+                                          <button
+                                            type="button"
+                                            className="docs-link-pill"
+                                            onClick={() => setSelectedPageId(linkedPage.id)}
                                           >
-                                            {formatSourceLabel(entry.sourceUrl ?? currentSourceUrl)}
+                                            Open
+                                          </button>
+                                        ) : entry.normalizedUrl ? (
+                                          <a href={entry.normalizedUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
+                                            Source
                                           </a>
-                                        ) : (
-                                          "—"
-                                        )}
+                                        ) : "—"}
                                       </td>
                                     </tr>
                                   );
@@ -1563,26 +1613,57 @@ export function DocsExplorer() {
                     onToggle={toggleSection}
                   >
                     <div className="docs-card-grid docs-accordion-grid">
-                      <div className="docs-card">
-                        <h3>Section Outline</h3>
+                      <div className="docs-card docs-card-wide">
                         {sections.length > 0 ? (
-                          <div className="docs-section-list">
-                            {sections.map((section) => (
-                              <div key={`${section.level}-${section.heading}-${section.anchor ?? ""}`} className="docs-section-item">
-                                <div className="docs-section-heading-row">
-                                  <div className="docs-section-heading-row docs-section-heading-main">
-                                    <span className="docs-section-level">H{section.level}</span>
-                                    <strong>{section.heading}</strong>
-                                  </div>
-                                  {section.sourceUrl ? (
-                                    <a href={section.sourceUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
-                                      {formatSourceLabel(section.sourceUrl)}
-                                    </a>
-                                  ) : null}
-                                </div>
-                                {section.paragraphs[0] ? <p>{truncateText(section.paragraphs[0], 220)}</p> : null}
-                              </div>
-                            ))}
+                          <div className="docs-outline">
+                            {(() => {
+                              const groups: { heading: typeof sections[0] | null; children: typeof sections }[] = [];
+                              for (const section of sections) {
+                                if (section.level <= 2) {
+                                  groups.push({ heading: section, children: [] });
+                                } else if (groups.length > 0) {
+                                  groups.at(-1)!.children.push(section);
+                                } else {
+                                  groups.push({ heading: null, children: [section] });
+                                }
+                              }
+                              return groups
+                                .filter((group) => {
+                                  if (group.heading) return true;
+                                  return group.children.some((s) => s.paragraphs[0]);
+                                })
+                                .map((group, groupIndex) => {
+                                  const withContent = group.children.filter((s) => s.paragraphs[0]);
+                                  const withoutContentNames = [...new Set(
+                                    group.children.filter((s) => !s.paragraphs[0]).map((s) => s.heading)
+                                  )];
+                                  return (
+                                    <div key={group.heading?.anchor ?? group.heading?.heading ?? groupIndex} className="docs-outline-group">
+                                      {group.heading ? (
+                                        <>
+                                          <div className="docs-outline-h2">
+                                            <strong>{group.heading.heading}</strong>
+                                          </div>
+                                          {group.heading.paragraphs[0] ? <p className="docs-outline-text">{truncateText(group.heading.paragraphs[0], 220)}</p> : null}
+                                        </>
+                                      ) : null}
+                                      {withContent.map((s, i) => (
+                                        <div key={`${s.heading}-${s.anchor ?? i}`} className="docs-outline-detail">
+                                          <span className="docs-outline-label">{s.heading}</span>
+                                          <span className="docs-outline-text">{truncateText(s.paragraphs[0], 180)}</span>
+                                        </div>
+                                      ))}
+                                      {withoutContentNames.length > 0 ? (
+                                        <div className="docs-outline-tags">
+                                          {withoutContentNames.map((name) => (
+                                            <span key={name} className="docs-outline-tag">{name}</span>
+                                          ))}
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  );
+                                });
+                            })()}
                           </div>
                         ) : extracted?.headings.length ? (
                           <div className="docs-chip-list">
@@ -1592,47 +1673,6 @@ export function DocsExplorer() {
                           </div>
                         ) : (
                           <p className="docs-empty-state">No section outline extracted yet.</p>
-                        )}
-                      </div>
-
-                      <div className="docs-card">
-                        <h3>Structured Tables</h3>
-                        {tables.length > 0 ? (
-                          <div className="docs-table-stack">
-                            {tables.slice(0, 6).map((table, index) => (
-                              <section key={`${table.caption ?? "table"}-${table.sourceUrl ?? index}`} className="docs-table-preview">
-                                <div className="docs-table-preview-header">
-                                  <div>
-                                    <strong>{table.caption ?? table.sectionHeading ?? `Table ${index + 1}`}</strong>
-                                    <span>{table.rows.length} rows</span>
-                                  </div>
-                                  {table.sourceUrl ? (
-                                    <a href={table.sourceUrl} target="_blank" rel="noreferrer" className="docs-open-link docs-mono">
-                                      {formatSourceLabel(table.sourceUrl)}
-                                    </a>
-                                  ) : null}
-                                </div>
-                                {table.headers.length > 0 ? (
-                                  <div className="docs-chip-list">
-                                    {table.headers.map((header) => (
-                                      <span key={`${index}-${header}`} className="docs-chip">{header}</span>
-                                    ))}
-                                  </div>
-                                ) : null}
-                                <div className="docs-table-preview-rows">
-                                  {table.rows.slice(0, 5).map((row, rowIndex) => (
-                                    <div key={`${index}-${rowIndex}`} className="docs-table-preview-row">
-                                      {row.cells.map((cell, cellIndex) => (
-                                        <span key={`${index}-${rowIndex}-${cellIndex}`}>{cell || "—"}</span>
-                                      ))}
-                                    </div>
-                                  ))}
-                                </div>
-                              </section>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="docs-empty-state">No structured tables extracted yet.</p>
                         )}
                       </div>
                     </div>
@@ -1723,13 +1763,26 @@ export function DocsExplorer() {
                   </AccordionSection>
 
                   <AccordionSection
-                    id="history"
-                    title="Snapshot History"
+                    id="debug"
+                    title="History & Debug"
                     meta={`${pageDetail.snapshots.length} snapshots · ${pageDetail.changes.length} changes`}
-                    isOpen={openSections.has("history")}
+                    isOpen={openSections.has("debug")}
                     onToggle={toggleSection}
                   >
                     <div className="docs-card-grid docs-accordion-grid">
+                      <div className="docs-card">
+                        <h3>Extraction Shape</h3>
+                        <dl className="docs-kv-list">
+                          <div><dt>Parser</dt><dd>{selectedSnapshot?.parserVersion ?? "Unknown"}</dd></div>
+                          <div><dt>Headings</dt><dd>{extracted?.headings.length ?? 0}</dd></div>
+                          <div><dt>Sections</dt><dd>{sections.length}</dd></div>
+                          <div><dt>Tables</dt><dd>{tables.length}</dd></div>
+                          <div><dt>Node Rows</dt><dd>{nodeDirectory.length}</dd></div>
+                          <div><dt>Collections</dt><dd>{referenceCollections.length}</dd></div>
+                          <div><dt>Discovered URLs</dt><dd>{extracted?.discoveredUrls.length ?? 0}</dd></div>
+                        </dl>
+                      </div>
+
                       <div className="docs-card">
                         <h3>Snapshots</h3>
                         <div className="docs-snapshot-list">
@@ -1763,17 +1816,7 @@ export function DocsExplorer() {
                           )}
                         </div>
                       </div>
-                    </div>
-                  </AccordionSection>
 
-                  <AccordionSection
-                    id="activity"
-                    title="Recent Activity"
-                    meta={`${overview?.recentRuns.length ?? 0} runs · ${overview?.recentChanges.length ?? 0} changes`}
-                    isOpen={openSections.has("activity")}
-                    onToggle={toggleSection}
-                  >
-                    <div className="docs-card-grid docs-accordion-grid">
                       <div className="docs-card">
                         <h3>Recent Sync Runs</h3>
                         <div className="docs-mini-list">
@@ -1812,17 +1855,7 @@ export function DocsExplorer() {
                           )}
                         </div>
                       </div>
-                    </div>
-                  </AccordionSection>
 
-                  <AccordionSection
-                    id="raw"
-                    title="Raw Snapshot"
-                    meta={selectedSnapshot ? `${selectedSnapshot.fetchMode} · ${shortHash(selectedSnapshot.contentHash)}` : undefined}
-                    isOpen={openSections.has("raw")}
-                    onToggle={toggleSection}
-                  >
-                    <div className="docs-card-grid docs-accordion-grid">
                       <div className="docs-card">
                         <h3>Raw Text Preview</h3>
                         <pre>{selectedSnapshot?.rawText ?? extracted?.textPreview ?? "No snapshot selected."}</pre>

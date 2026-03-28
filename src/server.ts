@@ -13,12 +13,13 @@ import { z } from "zod";
 import { initializeDatabaseSchema } from "./lib/init-db.js";
 import { prisma } from "./lib/prisma.js";
 import {
+  ensureDocSource,
   getDocPageDetail,
   getDocsOverview,
   getDocSnapshot,
   listDocPages
 } from "./services/docs/queries.js";
-import { syncMetaGraphDocs } from "./services/docs/sync.js";
+import { importMissingDocPages, syncMetaGraphDocs, syncSingleDocPage } from "./services/docs/sync.js";
 import { saveDocsTreeExport } from "./services/docs/tree-export.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -125,6 +126,31 @@ async function buildServer() {
     }
   });
 
+  app.post("/api/docs/pages/:pageId/fetch", async (request, reply) => {
+    try {
+      const { pageId } = request.params as { pageId: string };
+      const page = await prisma.docPage.findUnique({
+        where: { id: pageId },
+        select: { id: true, url: true, sourceId: true }
+      });
+      if (!page) {
+        return reply.status(404).send({ error: "Page not found" });
+      }
+      const source = await ensureDocSource();
+      const result = await syncSingleDocPage(source.id, page.url);
+      return reply.status(200).send({
+        pageId: result.pageId,
+        changed: result.changed,
+        discoveredUrls: result.discoveredUrls
+      });
+    } catch (error) {
+      const normalized = normalizeError(error);
+      return reply.status(normalized.statusCode).send({
+        error: normalized.message
+      });
+    }
+  });
+
   app.post("/api/docs/sync", async (request, reply) => {
     try {
       const body = z
@@ -140,6 +166,40 @@ async function buildServer() {
       });
 
       return reply.status(201).send(run);
+    } catch (error) {
+      const normalized = normalizeError(error);
+      return reply.status(normalized.statusCode).send({
+        error: normalized.message
+      });
+    }
+  });
+
+  app.post("/api/docs/import-missing", async (request, reply) => {
+    try {
+      const body = z
+        .object({
+          maxPages: z.number().int().positive().max(1000).nullable().optional(),
+          referenceOnly: z.boolean().default(true),
+          version: z.string().trim().min(1).max(32).nullable().optional().default("latest"),
+          delayMs: z.number().int().min(250).max(10_000).optional(),
+          jitterMs: z.number().int().min(0).max(5_000).optional()
+        })
+        .parse(request.body ?? {});
+
+      const result = await importMissingDocPages({
+        maxPages: body.maxPages ?? null,
+        referenceOnly: body.referenceOnly,
+        version: body.version,
+        delayMs: body.delayMs,
+        jitterMs: body.jitterMs,
+        trigger: "api:import-missing",
+        requestedBy: "dashboard"
+      });
+
+      return reply.status(201).send({
+        run: result.run,
+        remainingPages: result.remainingPages
+      });
     } catch (error) {
       const normalized = normalizeError(error);
       return reply.status(normalized.statusCode).send({

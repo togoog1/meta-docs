@@ -21,6 +21,16 @@ interface SyncDocInput {
   requestedBy?: string;
 }
 
+interface ImportMissingDocInput {
+  maxPages?: number | null;
+  trigger?: string;
+  requestedBy?: string;
+  referenceOnly?: boolean;
+  version?: string | "latest" | null;
+  delayMs?: number;
+  jitterMs?: number;
+}
+
 interface ExtractionDiagnostics {
   pageId: string;
   url: string;
@@ -52,6 +62,115 @@ const shouldLogVerboseExtractionDiagnostics =
 
 function getPathname(url: string): string {
   return new URL(url).pathname.replace(/\/+$/u, "") || "/";
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getImportDelayMs(inputDelayMs?: number) {
+  const configured = Number.parseInt(process.env.DOCS_IMPORT_DELAY_MS ?? "", 10);
+  if (typeof inputDelayMs === "number" && Number.isFinite(inputDelayMs)) {
+    return Math.max(250, Math.min(inputDelayMs, 10_000));
+  }
+  if (Number.isFinite(configured)) {
+    return Math.max(250, Math.min(configured, 10_000));
+  }
+  return 1_250;
+}
+
+function getImportJitterMs(inputJitterMs?: number) {
+  const configured = Number.parseInt(process.env.DOCS_IMPORT_JITTER_MS ?? "", 10);
+  if (typeof inputJitterMs === "number" && Number.isFinite(inputJitterMs)) {
+    return Math.max(0, Math.min(inputJitterMs, 5_000));
+  }
+  if (Number.isFinite(configured)) {
+    return Math.max(0, Math.min(configured, 5_000));
+  }
+  return 350;
+}
+
+function resolveImportPauseMs(inputDelayMs?: number, inputJitterMs?: number) {
+  const delayMs = getImportDelayMs(inputDelayMs);
+  const jitterMs = getImportJitterMs(inputJitterMs);
+  if (jitterMs === 0) {
+    return delayMs;
+  }
+  return delayMs + Math.floor(Math.random() * (jitterMs + 1));
+}
+
+function detectDocVersionFromPath(path: string): string | null {
+  const normalized = path.replace(/^\/docs\/graph-api\/?/u, "").replace(/^\/+|\/+$/gu, "");
+  const segments = normalized ? normalized.split("/").filter(Boolean) : [];
+  if (segments[0] !== "reference") {
+    return null;
+  }
+  const candidate = segments[1] ?? "";
+  return /^v\d+\.\d+$/iu.test(candidate) ? candidate.slice(1) : null;
+}
+
+function matchesImportScope(
+  path: string,
+  input: Pick<ImportMissingDocInput, "referenceOnly" | "version">
+) {
+  if (input.referenceOnly !== false && !path.startsWith("/docs/graph-api/reference")) {
+    return false;
+  }
+
+  if (!input.version || input.version === "latest") {
+    return input.referenceOnly === false ? true : detectDocVersionFromPath(path) === null;
+  }
+
+  return detectDocVersionFromPath(path) === input.version;
+}
+
+async function findNextMissingDocPage(
+  sourceId: string,
+  input: Pick<ImportMissingDocInput, "referenceOnly" | "version">,
+  attemptedPageIds: Set<string>
+) {
+  const baseWhere: Prisma.DocPageWhereInput = {
+    sourceId,
+    latestSnapshotId: null,
+    path: {
+      startsWith: input.referenceOnly === false ? docSourceDefinition.allowedPath : "/docs/graph-api/reference"
+    }
+  };
+
+  const candidates = await prisma.docPage.findMany({
+    where: baseWhere,
+    orderBy: [{ updatedAt: "asc" }, { path: "asc" }],
+    take: 500,
+    select: {
+      id: true,
+      url: true,
+      path: true
+    }
+  });
+
+  return (
+    candidates.find((page) => !attemptedPageIds.has(page.id) && matchesImportScope(page.path, input)) ?? null
+  );
+}
+
+async function countMissingDocPages(
+  sourceId: string,
+  input: Pick<ImportMissingDocInput, "referenceOnly" | "version">
+) {
+  const candidates = await prisma.docPage.findMany({
+    where: {
+      sourceId,
+      latestSnapshotId: null,
+      path: {
+        startsWith: input.referenceOnly === false ? docSourceDefinition.allowedPath : "/docs/graph-api/reference"
+      }
+    },
+    select: {
+      path: true
+    }
+  });
+
+  return candidates.filter((page) => matchesImportScope(page.path, input)).length;
 }
 
 function computeGapFlags(input: {
@@ -173,7 +292,7 @@ async function ensureTargetPage(sourceId: string, url: string, relationType: Doc
   });
 }
 
-async function syncSingleDocPage(sourceId: string, url: string) {
+export async function syncSingleDocPage(sourceId: string, url: string) {
   const fetchResult = await fetchBestDocVariant(url);
   const responsePath = getPathname(fetchResult.responseUrl);
   const pageType = classifyDocPage(responsePath);
@@ -413,5 +532,105 @@ export async function syncMetaGraphDocs(input: SyncDocInput = {}) {
         finishedAt: new Date()
       }
     });
+  }
+}
+
+export async function importMissingDocPages(input: ImportMissingDocInput = {}) {
+  const source = await ensureDocSource();
+  const diagnosticsSummary: SyncDiagnosticsSummary = {
+    pages: []
+  };
+  const attemptedPageIds = new Set<string>();
+  const discoveredDuringRun = new Set<string>();
+  const maxPages = input.maxPages ?? null;
+  let pagesFetched = 0;
+  let pagesChanged = 0;
+
+  const syncRun = await prisma.docSyncRun.create({
+    data: {
+      sourceId: source.id,
+      trigger: input.trigger ?? "import-missing",
+      requestedBy: input.requestedBy,
+      maxPages
+    }
+  });
+
+  try {
+    while (maxPages === null || pagesFetched < maxPages) {
+      const nextPage = await findNextMissingDocPage(
+        source.id,
+        {
+          referenceOnly: input.referenceOnly,
+          version: input.version
+        },
+        attemptedPageIds
+      );
+
+      if (!nextPage) {
+        break;
+      }
+
+      attemptedPageIds.add(nextPage.id);
+      const result = await syncSingleDocPage(source.id, nextPage.url);
+      diagnosticsSummary.pages.push(result.diagnostics);
+      pagesFetched += 1;
+      if (result.changed) {
+        pagesChanged += 1;
+      }
+
+      for (const discoveredUrl of result.discoveredUrls) {
+        discoveredDuringRun.add(discoveredUrl);
+      }
+
+      const pauseMs = resolveImportPauseMs(input.delayMs, input.jitterMs);
+      if (pauseMs > 0) {
+        await sleep(pauseMs);
+      }
+    }
+
+    const remainingPages = await countMissingDocPages(source.id, {
+      referenceOnly: input.referenceOnly,
+      version: input.version
+    });
+
+    logExtractionSummary(diagnosticsSummary);
+
+    const run = await prisma.docSyncRun.update({
+      where: { id: syncRun.id },
+      data: {
+        status: DocSyncRunStatus.SUCCEEDED,
+        pagesFetched,
+        pagesChanged,
+        pagesDiscovered: discoveredDuringRun.size,
+        finishedAt: new Date()
+      }
+    });
+
+    return {
+      run,
+      remainingPages
+    };
+  } catch (error) {
+    logExtractionSummary(diagnosticsSummary);
+    const message = error instanceof Error ? error.message : "Unknown import error";
+    const run = await prisma.docSyncRun.update({
+      where: { id: syncRun.id },
+      data: {
+        status: DocSyncRunStatus.FAILED,
+        pagesFetched,
+        pagesChanged,
+        pagesDiscovered: discoveredDuringRun.size,
+        error: message,
+        finishedAt: new Date()
+      }
+    });
+
+    return {
+      run,
+      remainingPages: await countMissingDocPages(source.id, {
+        referenceOnly: input.referenceOnly,
+        version: input.version
+      })
+    };
   }
 }
